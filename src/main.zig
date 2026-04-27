@@ -1,5 +1,19 @@
 const std = @import("std");
 const build_options = @import("build_options");
+const windows = std.os.windows;
+
+const MB_ERR_INVALID_CHARS: windows.DWORD = 0x00000008;
+
+extern "kernel32" fn MultiByteToWideChar(
+    code_page: windows.UINT,
+    flags: windows.DWORD,
+    src: ?[*]const u8,
+    src_len: c_int,
+    dst: ?[*]u16,
+    dst_len: c_int,
+) callconv(.winapi) c_int;
+
+extern "kernel32" fn GetACP() callconv(.winapi) windows.UINT;
 
 const PayloadEntry = struct {
     name: []const u8,
@@ -34,27 +48,166 @@ pub fn main(init: std.process.Init) !u8 {
     const magic_mgc_path = try std.fs.path.join(arena, &.{ cache_dir, "magic.mgc" });
 
     const args = try init.minimal.args.toSlice(arena);
+    // yazi on Windows uses `file -bL --mime-type -f -` and writes paths via stdin.
+    // This payload mishandles both `-f -` and `-L`, so normalize them here.
+    const stdin_paths = if (usesFilesFromStdin(args))
+        try readFilesFromStdinPaths(arena, io)
+    else
+        &.{};
 
-    // 强制 -m 指向缓存中的 magic.mgc，摆脱对 MAGIC 环境变量的依赖。
+    // 强制 -r 保留原始文件名输出，并让 -m 指向缓存中的 magic.mgc。
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(arena, file_real_path);
+    try argv.append(arena, "-r");
     try argv.append(arena, "-m");
     try argv.append(arena, magic_mgc_path);
-    if (args.len > 1) for (args[1..]) |a| try argv.append(arena, a);
+    try appendForwardedArgs(arena, &argv, args);
+    try argv.appendSlice(arena, stdin_paths);
 
     var child = std.process.spawn(io, .{
         .argv = argv.items,
         .stdin = .inherit,
-        .stdout = .inherit,
-        .stderr = .inherit,
+        .stdout = .pipe,
+        .stderr = .pipe,
     }) catch |err| {
         std.debug.print("file_wrapper: spawn {s}: {t}\n", .{ file_real_path, err });
         return 127;
     };
+    defer child.kill(io);
+
+    var stdout_task = try io.concurrent(readStreamAlloc, .{ arena, io, child.stdout.?, .unlimited });
+    var stderr_task = try io.concurrent(readStreamAlloc, .{ arena, io, child.stderr.?, .unlimited });
+
+    const stdout_bytes = try stdout_task.await(io);
+    const stderr_bytes = try stderr_task.await(io);
+
+    try writeChildOutput(io, arena, std.Io.File.stdout(), stdout_bytes);
+    try writeChildOutput(io, arena, std.Io.File.stderr(), stderr_bytes);
 
     return switch (try child.wait(io)) {
         .exited => |code| code,
         else => 1,
+    };
+}
+
+fn writeChildOutput(io: std.Io, arena: std.mem.Allocator, out_file: std.Io.File, bytes: []const u8) !void {
+    if (bytes.len == 0) return;
+    const utf8 = try normalizeChildOutputAlloc(arena, bytes);
+    try out_file.writeStreamingAll(io, utf8);
+}
+
+fn normalizeChildOutputAlloc(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    if (bytes.len == 0 or std.unicode.utf8ValidateSlice(bytes)) return bytes;
+    return windowsAcpToUtf8Alloc(arena, bytes);
+}
+
+fn appendForwardedArgs(
+    arena: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    args: []const []const u8,
+) !void {
+    var i: usize = 1;
+    var literal_args = false;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (literal_args) {
+            try argv.append(arena, arg);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--")) {
+            literal_args = true;
+            try argv.append(arena, arg);
+            continue;
+        }
+        if (isFilesFromStdinPair(arg, if (i + 1 < args.len) args[i + 1] else null)) {
+            i += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--files-from")) {
+            if (i + 1 < args.len) {
+                try argv.append(arena, arg);
+                i += 1;
+                try argv.append(arena, args[i]);
+                continue;
+            }
+            continue;
+        }
+        if (isFilesFromStdinInline(arg)) continue;
+        if (normalizeForwardedArg(arg)) |sanitized| {
+            try argv.append(arena, sanitized);
+        }
+    }
+}
+
+// This Windows payload errors out on `-L`, while yazi's preset plugins add it by
+// default. Dropping it is more compatible than letting the whole invocation fail.
+fn normalizeForwardedArg(arg: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, arg, "-L")) return null;
+    if (std.mem.eql(u8, arg, "--dereference")) return null;
+    if (std.mem.eql(u8, arg, "-bL") or std.mem.eql(u8, arg, "-Lb")) return "-b";
+    return arg;
+}
+
+fn windowsAcpToUtf8Alloc(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    if (bytes.len == 0) return "";
+
+    const acp = GetACP();
+    const src_len = std.math.cast(c_int, bytes.len) orelse return error.InputTooLong;
+    const utf16_len = MultiByteToWideChar(acp, MB_ERR_INVALID_CHARS, bytes.ptr, src_len, null, 0);
+    if (utf16_len == 0) return windows.unexpectedError(windows.GetLastError());
+
+    const utf16 = try arena.alloc(u16, @intCast(utf16_len));
+    const written = MultiByteToWideChar(acp, MB_ERR_INVALID_CHARS, bytes.ptr, src_len, utf16.ptr, utf16_len);
+    if (written == 0) return windows.unexpectedError(windows.GetLastError());
+
+    return std.unicode.utf16LeToUtf8Alloc(arena, utf16[0..@intCast(written)]);
+}
+
+fn readFilesFromStdinPaths(arena: std.mem.Allocator, io: std.Io) ![][]const u8 {
+    const stdin_bytes = try readStreamAlloc(arena, io, std.Io.File.stdin(), .unlimited);
+    const utf8 = if (stdin_bytes.len == 0 or std.unicode.utf8ValidateSlice(stdin_bytes))
+        stdin_bytes
+    else
+        try windowsAcpToUtf8Alloc(arena, stdin_bytes);
+
+    var paths: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, utf8, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, "\r");
+        if (trimmed.len == 0) continue;
+        try paths.append(arena, trimmed);
+    }
+    return paths.toOwnedSlice(arena);
+}
+
+fn usesFilesFromStdin(args: []const []const u8) bool {
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (isFilesFromStdinPair(arg, if (i + 1 < args.len) args[i + 1] else null)) return true;
+        if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--files-from")) {
+            i += 1;
+            continue;
+        }
+        if (isFilesFromStdinInline(arg)) return true;
+    }
+    return false;
+}
+
+fn isFilesFromStdinPair(arg: []const u8, next: ?[]const u8) bool {
+    return (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--files-from")) and
+        next != null and std.mem.eql(u8, next.?, "-");
+}
+
+fn isFilesFromStdinInline(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "-f-") or std.mem.eql(u8, arg, "--files-from=-");
+}
+
+fn readStreamAlloc(gpa: std.mem.Allocator, io: std.Io, file: std.Io.File, limit: std.Io.Limit) ![]u8 {
+    var file_reader: std.Io.File.Reader = .initStreaming(file, io, &.{});
+    return file_reader.interface.allocRemaining(gpa, limit) catch |err| switch (err) {
+        error.ReadFailed => return file_reader.err.?,
+        else => |e| return e,
     };
 }
 
