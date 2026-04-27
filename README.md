@@ -27,8 +27,9 @@ file.exe --version
 
 ```powershell
 zig build
-# 产物：zig-out\bin\file.exe（约 11 MB）
 ```
+
+产物：`zig-out\bin\file.exe`（约 11 MB）
 
 如需更新 payload，替换 `payload/` 下对应文件后重新构建即可，缓存目录会自动随内容指纹切换。
 
